@@ -1,4 +1,8 @@
 # Warning: this is a WIP
+
+# TODO: fix juxtapose collate bug
+# TODO: needs an aggregation phase
+# TODO: collate index_measurement
 """
 Implementation of virtual products.
 Provides an interface to the products in the database
@@ -10,6 +14,7 @@ implementing the same interface.
 from __future__ import absolute_import
 
 from abc import ABC, abstractmethod
+from functools import reduce
 
 import xarray
 
@@ -34,12 +39,12 @@ class VirtualProduct(ABC):
 
     @abstractmethod
     def output_measurements(self, product_definitions):
-        # type: (Dict[str, dict])-> Dict[str, Measurement]
+        # type: (Dict[str, dict]) -> Dict[str, Measurement]
         """ A dictionary mapping names to measurement metadata. """
 
     @abstractmethod
-    def find_datasets(self, index, **query):
-        # type: (Index, Dict[str, Any]) -> DatasetPile
+    def find_datasets(self, dc, **query):
+        # type: (Datacube, Dict[str, Any]) -> DatasetPile
         """ Collection of datasets that match the query. """
 
     # no database access below this line
@@ -58,14 +63,15 @@ class VirtualProduct(ABC):
         # type: (RasterRecipe) -> xarray.Dataset
         """ Convert virtual raster to `xarray.Dataset`. """
 
-    def load(self, index, **query):
-        # type: (Index, Dict[str, Any]) -> xarray.Dataset
+    def load(self, dc, **query):
+        # type: (Datacube, Dict[str, Any]) -> xarray.Dataset
         """ Mimic `datacube.Datacube.load`. """
-        datasets = self.find_datasets(index, **query)
+        datasets = self.find_datasets(dc, **query)
         raster = self.build_raster(datasets, **query)
         observations = [self.fetch_data(observation)
-                        for _, observation in raster.split(dim='time')]
+                        for observation in raster.split(dim='time')]
         data = xarray.concat(observations, dim='time')
+
         return data
 
 
@@ -126,8 +132,8 @@ class RasterRecipe(object):
 
         (length,) = pile[dim].shape
         for i in range(length):
-            yield i, RasterRecipe(pile.isel(**{dim: slice(i, i + 1)}),
-                                  self.geobox, self.output_measurements)
+            yield RasterRecipe(pile.isel(**{dim: slice(i, i + 1)}),
+                               self.geobox, self.output_measurements)
 
 
 class BasicProduct(VirtualProduct):
@@ -168,7 +174,7 @@ class BasicProduct(VirtualProduct):
         except KeyError as ke:
             raise VirtualProductException("Could not find measurement: {}".format(ke.args))
 
-    def find_datasets(self, index, **query):
+    def find_datasets(self, dc, **query):
         # this is basically a copy of `datacube.Datacube.find_datasets_lazy`
         # ideally that method would look like this too in the future
 
@@ -177,6 +183,7 @@ class BasicProduct(VirtualProduct):
         # other possible query entries include `geopolygon`
         # and contents of `SPATIAL_KEYS` and `CRS_KEYS`
         # query should not include contents of `OTHER_KEYS` except `geopolygon`
+        index = dc.index
 
         # find the datasets
         query = Query(index, product=self.product_name, measurements=self.measurement_names,
@@ -233,11 +240,11 @@ class BasicProduct(VirtualProduct):
 
         # convert Measurements back to dicts?
         # essentially what `datacube.api.core.set_resampling_method` does
-        measurements = [dict(**measurement.__dict__)
+        measurements = [{**measurement.__dict__}
                         for measurement in raster.output_measurements.values()]
 
         if self.resampling_method is not None:
-            measurements = [dict(resampling_method=self.resampling_method, **measurement)
+            measurements = [{'resampling_method': self.resampling_method, **measurement}
                             for measurement in measurements]
 
         def unwrap(indexes, value):
@@ -278,8 +285,8 @@ class Transform(VirtualProduct):
     def output_measurements(self, product_definitions):
         return self.measurement_transform(self.child.output_measurements(product_definitions))
 
-    def find_datasets(self, index, **query):
-        return self.child.find_datasets(index, **query)
+    def find_datasets(self, dc, **query):
+        return self.child.find_datasets(dc, **query)
 
     def build_raster(self, datasets, **query):
         return self.child.build_raster(datasets, **query)
@@ -294,12 +301,12 @@ def transform(child, data_transform=None, measurement_transform=None, raster_tra
 
 
 class Collate(VirtualProduct):
-    def __init__(self, *children, **kwargs):
+    def __init__(self, *children, index_measurement_name=None):
         if len(children) == 0:
             raise VirtualProductException("No children for collate node")
 
         self.children = children
-        self.index_measurement_name = kwargs.get('index_measurement_name')
+        self.index_measurement_name = index_measurement_name
 
         name = self.index_measurement_name
         if name is not None:
@@ -311,8 +318,7 @@ class Collate(VirtualProduct):
         input_measurements = [child.output_measurements(product_definitions)
                               for child in self.children]
 
-        first = input_measurements[0]
-        rest = input_measurements[1:]
+        first, *rest = input_measurements
 
         for child in rest:
             if set(child) != set(first):
@@ -326,11 +332,12 @@ class Collate(VirtualProduct):
             msg = "Source index measurement '{}' already present".format(self.index_measurement_name)
             raise VirtualProductException(msg)
 
-        first.update(self.index_measurement)
-        return first
+        return {**first, **self.index_measurement}
 
-    def find_datasets(self, index, **query):
-        result = [child.find_datasets(index, **query)
+    def find_datasets(self, dc, **query):
+        index = dc.index
+
+        result = [child.find_datasets(dc, **query)
                   for child in self.children]
 
         # should possibly check all the `grid_spec`s are the same
@@ -386,14 +393,23 @@ class Collate(VirtualProduct):
 
             raise ValueError("Every child of CollatedDatasetPile object is None")
 
-        rasters = [child.fetch_data(raster.filter(is_from(i)).map(strip_source))
-                   for i, child in enumerate(self.children)]
+        def fetch_data(child, r):
+            size = reduce(lambda x, y: x * y, r.shape, 1)
 
-        return xarray.concat(rasters, dim='time')
+            if size > 0:
+                return child.fetch_data(r)
+            else:
+                # empty raster
+                return None
+
+        rasters = [fetch_data(child, raster.filter(is_from(source_index)).map(strip_source))
+                   for source_index, child in enumerate(self.children)]
+
+        return xarray.concat([r for r in rasters if r is not None], dim='time')
 
 
-def collate(*children, **kwargs):
-    return Collate(*children, **kwargs)
+def collate(*children, index_measurement_name=None):
+    return Collate(*children, index_measurement_name=index_measurement_name)
 
 
 class Juxtapose(VirtualProduct):
@@ -418,9 +434,11 @@ class Juxtapose(VirtualProduct):
 
         return result
 
-    def find_datasets(self, index, **query):
+    def find_datasets(self, dc, **query):
+        index = dc.index
+
         product_definitions = product_definitions_from_index(index)
-        result = [child.find_datasets(index, **query)
+        result = [child.find_datasets(dc, **query)
                   for child in self.children]
 
         # should possibly check all the `grid_spec`s are the same
@@ -473,7 +491,7 @@ class Juxtapose(VirtualProduct):
             child_raster = raster.map(select_child(source_index))
             grouped = child_raster.grouped_dataset_pile
 
-            # bad assumption!
+            # can `grouped` really be empty?
             child_measurements = grouped.item(0).output_measurements
             return RasterRecipe(grouped, geobox, child_measurements)
 
