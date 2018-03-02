@@ -1,7 +1,6 @@
 # Warning: this is a WIP
 
-# TODO: fix juxtapose collate bug
-# TODO: needs an aggregation phase
+# TODO: needs an aggregation phase (use xarray.DataArray.groupby?)
 # TODO: collate index_measurement
 """
 Implementation of virtual products.
@@ -47,11 +46,11 @@ class VirtualProduct(ABC):
         # type: (Datacube, Dict[str, Any]) -> DatasetPile
         """ Collection of datasets that match the query. """
 
-    # no database access below this line
+    # no index access below this line
 
     @abstractmethod
     def build_raster(self, datasets, **query):
-        # type: (VirtualDatasetPile, Dict[str, Any]) -> RasterRecipe
+        # type: (DatasetPile, Dict[str, Any]) -> RasterRecipe
         """
         Datasets grouped by their timestamps.
         :param datasets: the datasets to fetch data from
