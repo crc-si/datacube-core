@@ -1,7 +1,5 @@
-# TODO: needs an aggregation phase (use xarray.DataArray.groupby?)
 # TODO: measurement dependency tracking
 # TODO: a mechanism to set settings for the leaf notes
-# TODO: lineage tracking per observation
 # TODO: integrate GridWorkflow functionality (spatial binning)
 
 """
@@ -11,7 +9,7 @@ products implementing the same interface.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from functools import reduce
 from typing import Any, Dict, List, cast
 
@@ -24,7 +22,7 @@ from datacube.api.core import select_datasets_inside_polygon, output_geobox, app
 from datacube.api.grid_workflow import _fast_slice
 from datacube.api.query import Query, query_group_by, query_geopolygon
 from datacube.model import Measurement, DatasetType
-from datacube.model.utils import xr_apply
+from datacube.model.utils import xr_apply, xr_iter
 
 from .utils import qualified_name, merge_dicts
 from .utils import select_unique, select_keys, reject_keys, merge_search_terms
@@ -35,7 +33,7 @@ class VirtualProductException(Exception):
     pass
 
 
-class QueryResult:
+class VirtualDatasetBag:
     """ Result of `VirtualProduct.query`. """
     def __init__(self, pile, grid_spec, geopolygon, product_definitions):
         self.pile = pile
@@ -44,7 +42,7 @@ class QueryResult:
         self.product_definitions = product_definitions
 
 
-class DatasetPile:
+class VirtualDatasetBox:
     """ Result of `VirtualProduct.group`. """
     # our replacement for grid_workflow.Tile basically
     # TODO: copy the Tile API
@@ -70,20 +68,21 @@ class DatasetPile:
         return self.pile.shape + self.geobox.shape
 
     def __getitem__(self, chunk):
+        # TODO: test this functionality
         pile = self.pile
 
-        return DatasetPile(_fast_slice(pile, chunk[:len(pile.shape)]),
-                           self.geobox[chunk[len(pile.shape):]],
-                           self.product_definitions)
+        return VirtualDatasetBox(_fast_slice(pile, chunk[:len(pile.shape)]),
+                                 self.geobox[chunk[len(pile.shape):]],
+                                 self.product_definitions)
 
     def map(self, func, dtype='O'):
-        return DatasetPile(xr_apply(self.pile, func, dtype=dtype), self.geobox, self.product_definitions)
+        return VirtualDatasetBox(xr_apply(self.pile, func, dtype=dtype), self.geobox, self.product_definitions)
 
     def filter(self, predicate):
         mask = self.map(predicate, dtype='bool')
 
         # NOTE: this could possibly result in an empty pile
-        return DatasetPile(self.pile[mask.pile], self.geobox, self.product_definitions)
+        return VirtualDatasetBox(self.pile[mask.pile], self.geobox, self.product_definitions)
 
     def split(self, dim='time'):
         # this is slightly different from Tile.split
@@ -91,7 +90,34 @@ class DatasetPile:
 
         [length] = pile[dim].shape
         for i in range(length):
-            yield DatasetPile(pile.isel(**{dim: slice(i, i + 1)}), self.geobox, self.product_definitions)
+            yield VirtualDatasetBox(pile.isel(**{dim: slice(i, i + 1)}), self.geobox, self.product_definitions)
+
+    def input_datasets(self):
+        def traverse(entry):
+            if isinstance(entry, Mapping):
+                if 'collate' in entry:
+                    _, child = entry['collate']
+                    yield from traverse(child)
+                elif 'juxtapose' in entry:
+                    for child in entry['juxtapose']:
+                        yield from traverse(child)
+                else:
+                    raise VirtualProductException("malformed box")
+
+            elif isinstance(entry, Sequence):
+                yield from entry
+
+            elif isinstance(entry, VirtualDatasetBox):
+                for _, _, child in xr_iter(entry.input_datasets()):
+                    yield from child
+
+            else:
+                raise VirtualProductException("malformed box")
+
+        def worker(index, entry):
+            return set(traverse(entry))
+
+        return self.map(worker).pile
 
 
 class Transformation(ABC):
@@ -134,6 +160,7 @@ class VirtualProduct(Mapping):
         - transform: on-the-fly computation on data being loaded
         - collate: stack observations from products with the same set of measurements
         - juxtapose: put measurements from different products side-by-side
+        - aggregate: take (non-spatial) statistics of grouped data
     """
 
     _GEOBOX_KEYS = ['output_crs', 'resolution', 'align']
@@ -181,6 +208,21 @@ class VirtualProduct(Mapping):
         return cast(Transformation, obj)
 
     @property
+    def _statistic(self) -> Transformation:
+        """ The `Transformation` object associated with an aggregate product. """
+        cls = self['aggregate']
+
+        try:
+            obj = cls(**{key: value for key, value in self.items()
+                         if key not in ['aggregate', 'input', 'group_by']})
+        except TypeError:
+            raise VirtualProductException("transformation {} could not be instantiated".format(cls))
+
+        self._assert(isinstance(obj, Transformation), "not a transformation object: {}".format(obj))
+
+        return cast(Transformation, obj)
+
+    @property
     def _input(self) -> 'VirtualProduct':
         """ The input product of a transform product. """
         return VirtualProduct(self['input'])
@@ -204,8 +246,9 @@ class VirtualProduct(Mapping):
 
     @property
     def _kind(self):
-        """ One of product, transform, collate, or juxtapose. """
-        candidates = [key for key in list(self) if key in ['product', 'transform', 'collate', 'juxtapose']]
+        """ One of product, transform, collate, juxtapose, or aggregate. """
+        candidates = [key for key in list(self)
+                      if key in ['product', 'transform', 'collate', 'juxtapose', 'aggregate']]
         self._assert(len(candidates) == 1, "ambiguous kind")
         return candidates[0]
 
@@ -216,9 +259,8 @@ class VirtualProduct(Mapping):
         A dictionary mapping names to measurement metadata.
         :param product_definitions: a dictionary mapping product names to products (`DatasetType` objects)
         """
-        get = self.get
 
-        if 'product' in self:
+        def _product_measurements_():
             self._assert(self._product in product_definitions,
                          "product {} not found in definitions".format(self._product))
 
@@ -226,7 +268,7 @@ class VirtualProduct(Mapping):
             measurements = {measurement['name']: Measurement(**measurement)
                             for measurement in product.definition['measurements']}
 
-            if get('measurements') is None:
+            if self.get('measurements') is None:
                 return measurements
 
             try:
@@ -235,12 +277,12 @@ class VirtualProduct(Mapping):
             except KeyError as ke:
                 raise VirtualProductException("could not find measurement: {}".format(ke.args))
 
-        elif 'transform' in self:
+        def _transform_measurements_():
             input_measurements = self._input.output_measurements(product_definitions)
 
             return self._transformation.measurements(input_measurements)
 
-        elif 'collate' in self:
+        def _collate_measurements_():
             input_measurement_list = [child.output_measurements(product_definitions)
                                       for child in self._children]
 
@@ -250,7 +292,7 @@ class VirtualProduct(Mapping):
                 self._assert(set(child) == set(first),
                              "child datasets do not all have the same set of measurements")
 
-            name = get('index_measurement_name')
+            name = self.get('index_measurement_name')
             if name is None:
                 return first
 
@@ -259,7 +301,7 @@ class VirtualProduct(Mapping):
             first.update({name: Measurement(name=name, dtype='int8', nodata=-1, units='1')})
             return first
 
-        elif 'juxtapose' in self:
+        def _juxtapose_measurements_():
             input_measurement_list = [child.output_measurements(product_definitions)
                                       for child in self._children]
 
@@ -272,14 +314,28 @@ class VirtualProduct(Mapping):
 
             return result
 
+        def _aggregate_measurements_():
+            input_measurements = self._input.output_measurements(product_definitions)
+
+            return self._statistic.measurements(input_measurements)
+
+        if 'product' in self:
+            return _product_measurements_()
+        elif 'transform' in self:
+            return _transform_measurements_()
+        elif 'collate' in self:
+            return _collate_measurements_()
+        elif 'juxtapose' in self:
+            return _juxtapose_measurements_()
+        elif 'aggregate' in self:
+            return _aggregate_measurements_()
         else:
             raise VirtualProductException("virtual product was not validated")
 
-    def query(self, dc: Datacube, **search_terms: Dict[str, Any]) -> QueryResult:
+    def query(self, dc: Datacube, **search_terms: Dict[str, Any]) -> VirtualDatasetBag:
         """ Collection of datasets that match the query. """
-        get = self.get
 
-        if 'product' in self:
+        def _product_query_():
             product = dc.index.products.get_by_name(self._product)
             if product is None:
                 raise VirtualProductException("could not find product {}".format(self._product))
@@ -297,75 +353,78 @@ class VirtualProduct(Mapping):
                 datasets = select_datasets_inside_polygon(datasets, query.geopolygon)
 
             # should we put it in the Transformation class?
-            if get('dataset_predicate') is not None:
+            if self.get('dataset_predicate') is not None:
                 datasets = [dataset
                             for dataset in datasets
                             if self['dataset_predicate'](dataset)]
 
-            return QueryResult(list(datasets), product.grid_spec, query.geopolygon,
-                               {product.name: product})
+            return VirtualDatasetBag(list(datasets), product.grid_spec, query.geopolygon,
+                                     {product.name: product})
 
-        elif 'transform' in self:
+        def _transform_or_aggregate_query_():
             return self._input.query(dc, **search_terms)
 
-        elif 'collate' in self or 'juxtapose' in self:
+        def _collate_or_juxtapose_query_():
             result = [child.query(dc, **search_terms)
                       for child in self._children]
 
-            return QueryResult({self._kind: [datasets.pile for datasets in result]},
-                               select_unique([datasets.grid_spec for datasets in result]),
-                               select_unique([datasets.geopolygon for datasets in result]),
-                               merge_dicts([datasets.product_definitions for datasets in result]))
-
+            return VirtualDatasetBag({self._kind: [datasets.pile for datasets in result]},
+                                     select_unique([datasets.grid_spec for datasets in result]),
+                                     select_unique([datasets.geopolygon for datasets in result]),
+                                     merge_dicts([datasets.product_definitions for datasets in result]))
+        if 'product' in self:
+            return _product_query_()
+        elif 'transform' in self or 'aggregate' in self:
+            return _transform_or_aggregate_query_()
+        elif 'collate' in self or 'juxtapose' in self:
+            return _collate_or_juxtapose_query_()
         else:
             raise VirtualProductException("virtual product was not validated")
 
     # no index access below this line
 
-    def group(self, datasets, **search_terms):
-        # type: (QueryResult, Dict[str, Any]) -> DatasetPile
+    def group(self, datasets: VirtualDatasetBag, **search_terms: Dict[str, Any]) -> VirtualDatasetBox:
         """
         Datasets grouped by their timestamps.
-        :param datasets: the `QueryResult` to fetch data from
+        :param datasets: the `VirtualDatasetBag` to fetch data from
         :param query: to specify a spatial sub-region
         """
-        grid_spec = datasets.grid_spec
-        geopolygon = datasets.geopolygon
-
-        if 'product' in self:
+        def _product_group_():
             # select only those inside the ROI
             # ROI could be smaller than the query for the `query` method
+
             if query_geopolygon(**search_terms) is not None:
                 geopolygon = query_geopolygon(**search_terms)
                 selected = list(select_datasets_inside_polygon(datasets.pile, geopolygon))
             else:
+                geopolygon = datasets.geopolygon
                 selected = list(datasets.pile)
 
             # geobox
             merged = merge_search_terms(select_keys(self, self._NON_SPATIAL_KEYS),
                                         select_keys(search_terms, self._NON_SPATIAL_KEYS))
 
-            geobox = output_geobox(datasets=selected, grid_spec=grid_spec,
+            geobox = output_geobox(datasets=selected, grid_spec=datasets.grid_spec,
                                    geopolygon=geopolygon, **select_keys(merged, self._GEOBOX_KEYS))
 
             # group by time
             group_query = query_group_by(**select_keys(merged, self._GROUPING_KEYS))
 
             # information needed for Datacube.load_data
-            return DatasetPile(Datacube.group_datasets(selected, group_query),
-                               geobox,
-                               datasets.product_definitions)
+            return VirtualDatasetBox(Datacube.group_datasets(selected, group_query),
+                                     geobox,
+                                     datasets.product_definitions)
 
-        elif 'transform' in self:
+        def _transform_group_():
             return self._input.group(datasets, **search_terms)
 
-        elif 'collate' in self:
+        def _collate_group_():
             self._assert('collate' in datasets.pile and len(datasets.pile['collate']) == len(self._children),
                          "invalid dataset pile")
 
             def build(source_index, product, dataset_pile):
-                grouped = product.group(QueryResult(dataset_pile, datasets.grid_spec,
-                                                    datasets.geopolygon, datasets.product_definitions),
+                grouped = product.group(VirtualDatasetBag(dataset_pile, datasets.grid_spec,
+                                                          datasets.geopolygon, datasets.product_definitions),
                                         **search_terms)
 
                 def tag(_, value):
@@ -377,16 +436,16 @@ class VirtualProduct(Mapping):
                       for source_index, (product, dataset_pile)
                       in enumerate(zip(self._children, datasets.pile['collate']))]
 
-            return DatasetPile(xarray.concat([grouped.pile for grouped in groups], dim='time'),
-                               select_unique([grouped.geobox for grouped in groups]),
-                               merge_dicts([grouped.product_definitions for grouped in groups]))
+            return VirtualDatasetBox(xarray.concat([grouped.pile for grouped in groups], dim=self.get('dim', 'time')),
+                                     select_unique([grouped.geobox for grouped in groups]),
+                                     merge_dicts([grouped.product_definitions for grouped in groups]))
 
-        elif 'juxtapose' in self:
+        def _juxtapose_group_():
             self._assert('juxtapose' in datasets.pile and len(datasets.pile['juxtapose']) == len(self._children),
                          "invalid dataset pile")
 
-            groups = [product.group(QueryResult(dataset_pile, datasets.grid_spec,
-                                                datasets.geopolygon, datasets.product_definitions),
+            groups = [product.group(VirtualDatasetBag(dataset_pile, datasets.grid_spec,
+                                                      datasets.geopolygon, datasets.product_definitions),
                                     **search_terms)
                       for product, dataset_pile in zip(self._children, datasets.pile['juxtapose'])]
 
@@ -395,14 +454,37 @@ class VirtualProduct(Mapping):
             def tuplify(indexes, _):
                 return {'juxtapose': [pile.sel(**indexes).item() for pile in aligned_piles]}
 
-            return DatasetPile(xr_apply(aligned_piles[0], tuplify),
-                               select_unique([grouped.geobox for grouped in groups]),
-                               merge_dicts([grouped.product_definitions for grouped in groups]))
+            return VirtualDatasetBox(xr_apply(aligned_piles[0], tuplify),
+                                     select_unique([grouped.geobox for grouped in groups]),
+                                     merge_dicts([grouped.product_definitions for grouped in groups]))
 
+        def _aggregate_group_():
+            grouped = self._input.group(datasets, **search_terms)
+            dim = self.get('dim', 'time')
+
+            def to_box(value):
+                return xarray.DataArray([VirtualDatasetBox(value, grouped.geobox, grouped.product_definitions)],
+                                        dims=['_fake_'])
+
+            result = grouped.pile.groupby(self['group_by'](grouped.pile[dim])).apply(to_box).squeeze('_fake_')
+            result[dim].attrs.update(grouped.pile[dim].attrs)
+
+            return VirtualDatasetBox(result, grouped.geobox, grouped.product_definitions)
+
+        if 'product' in self:
+            return _product_group_()
+        elif 'transform' in self:
+            return _transform_group_()
+        elif 'collate' in self:
+            return _collate_group_()
+        elif 'juxtapose' in self:
+            return _juxtapose_group_()
+        elif 'aggregate' in self:
+            return _aggregate_group_()
         else:
             raise VirtualProductException("virtual product was not validated")
 
-    def fetch(self, grouped: DatasetPile, **load_settings: Dict[str, Any]) -> xarray.Dataset:
+    def fetch(self, grouped: VirtualDatasetBox, **load_settings: Dict[str, Any]) -> xarray.Dataset:
         """ Convert grouped datasets to `xarray.Dataset`. """
         # TODO: provide `load_lazy` and `load_strict` instead
 
@@ -410,7 +492,7 @@ class VirtualProduct(Mapping):
         product_definitions = grouped.product_definitions
         _ = self.output_measurements(product_definitions)
 
-        if 'product' in self:
+        def _product_fetch_():
             merged = merge_search_terms(select_keys(self, self._LOAD_KEYS),
                                         select_keys(load_settings, self._LOAD_KEYS))
 
@@ -424,10 +506,10 @@ class VirtualProduct(Mapping):
 
             return apply_aliases(result, product_definitions[self._product], list(measurements))
 
-        elif 'transform' in self:
+        def _transform_fetch_():
             return self._transformation.compute(self._input.fetch(grouped, **load_settings))
 
-        elif 'collate' in self:
+        def _collate_fetch_():
             def is_from(source_index):
                 def result(_, value):
                     self._assert('collate' in value, "malformed dataset pile in collate")
@@ -466,9 +548,11 @@ class VirtualProduct(Mapping):
 
             non_empty = [g for g in groups if g is not None]
 
-            return xarray.concat(non_empty, dim='time').assign_attrs(**select_unique([g.attrs for g in non_empty]))
+            return xarray.concat(non_empty,
+                                 dim=self.get('dim', 'time')).assign_attrs(**select_unique([g.attrs
+                                                                                            for g in non_empty]))
 
-        elif 'juxtapose' in self:
+        def _juxtapose_fetch_():
             def select_child(source_index):
                 def result(_, value):
                     self._assert('juxtapose' in value, "malformed dataset pile in juxtapose")
@@ -478,13 +562,41 @@ class VirtualProduct(Mapping):
 
             def fetch_recipe(source_index):
                 child_groups = grouped.map(select_child(source_index))
-                return DatasetPile(child_groups.pile, grouped.geobox, grouped.product_definitions)
+                return VirtualDatasetBox(child_groups.pile, grouped.geobox, grouped.product_definitions)
 
             groups = [child.fetch(fetch_recipe(source_index), **load_settings)
                       for source_index, child in enumerate(self._children)]
 
             return xarray.merge(groups).assign_attrs(**select_unique([g.attrs for g in groups]))
 
+        def _aggregate_fetch_():
+            dim = self.get('dim', 'time')
+
+            def xr_map(array, func):
+                # convenient function close to `xr_apply` in spirit
+                coords = {key: value.values for key, value in array.coords.items()}
+                for i in numpy.ndindex(array.shape):
+                    yield func({key: value[i] for key, value in coords.items()}, array.values[i])
+
+            def statistic(coords, value):
+                data = self._input.fetch(value, **load_settings)
+                result = self._statistic.compute(data)
+                result.coords[dim] = coords[dim]
+                return result
+
+            groups = list(xr_map(grouped.pile, statistic))
+            return xarray.concat(groups, dim=dim).assign_attrs(**select_unique([g.attrs for g in groups]))
+
+        if 'product' in self:
+            return _product_fetch_()
+        elif 'transform' in self:
+            return _transform_fetch_()
+        elif 'collate' in self:
+            return _collate_fetch_()
+        elif 'juxtapose' in self:
+            return _juxtapose_fetch_()
+        elif 'aggregate' in self:
+            return _aggregate_fetch_()
         else:
             raise VirtualProductException("virtual product was not validated")
 
@@ -509,15 +621,20 @@ class VirtualProduct(Mapping):
                 children = [reconstruct(child) for child in product['juxtapose']]
                 return dict(juxtapose=children, **reject_keys(product, ['juxtapose']))
 
+            if 'aggregate' in product:
+                input_product = reconstruct(product['input'])
+                return dict(aggregate=qualified_name(product['aggregate']),
+                            group_by=qualified_name(product['group_by']),
+                            input=input_product, **reject_keys(product, ['input', 'aggregate', 'group_by']))
+
             else:
                 raise VirtualProductException("virtual product was not validated")
 
         return yaml.dump(reconstruct(self), Dumper=yaml.CDumper,
                          default_flow_style=False, indent=2)
 
-    def load(self, dc, **query):
-        # type: (Datacube, Dict[str, Any]) -> xarray.Dataset
+    def load(self, dc: Datacube, **query: Dict[str, Any]) -> xarray.Dataset:
         """ Mimic `datacube.Datacube.load`. For illustrative purposes. May be removed in the future. """
         datasets = self.query(dc, **query)
         grouped = self.group(datasets, **query)
-        return self.fetch(grouped, **query).sortby('time')
+        return self.fetch(grouped, **query)
